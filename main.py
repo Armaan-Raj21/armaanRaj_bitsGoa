@@ -12,7 +12,7 @@ from PIL import Image
 
 app = FastAPI()
 
-# Get API Key and strip whitespace just in case
+# Get API Key
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 class DocumentRequest(BaseModel):
@@ -43,52 +43,53 @@ def image_to_base64(image):
     image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def get_dynamic_model_name():
+def get_generative_model_name():
     """
-    Asks Google which models are available for this specific API Key
-    and selects the best one dynamically.
+    Asks Google for models that specifically support 'generateContent'.
+    Ignores embedding models.
     """
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GENAI_API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            print(f"Error listing models: {response.text}")
-            return "models/gemini-1.5-flash" # Fallback
+            # Fallback if list fails
+            return "models/gemini-1.5-flash"
 
         data = response.json()
-        available_models = [m['name'] for m in data.get('models', [])]
-        print(f"AVAILABLE MODELS FOR THIS KEY: {available_models}")
+        
+        # 1. Filter: Only keep models that can GENERATE content
+        valid_models = []
+        for m in data.get('models', []):
+            methods = m.get('supportedGenerationMethods', [])
+            if 'generateContent' in methods:
+                valid_models.append(m['name'])
+        
+        print(f"VALID MODELS: {valid_models}")
+        
+        if not valid_models:
+            raise Exception("No generative models available for this API Key.")
 
-        # Priority list: Look for these strings in the available models
-        # We prefer Flash 1.5, then Pro 1.5, then any Flash
-        priorities = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-vision"]
+        # 2. Priority: Try to find the best Gemini model
+        priorities = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-vision", "gemini-1.0-pro"]
         
         for p in priorities:
-            for model in available_models:
-                if p in model:
-                    print(f"Selected Model: {model}")
-                    return model # Return full name e.g. 'models/gemini-1.5-flash-001'
+            for vm in valid_models:
+                if p in vm:
+                    return vm
         
-        # If no specific match, take ANY model that supports generation
-        if available_models:
-            return available_models[0]
-            
-        return "models/gemini-1.5-flash" # Ultimate fallback
+        # 3. Fallback: Just take the first one that works
+        return valid_models[0]
         
     except Exception as e:
-        print(f"Model selection failed: {e}")
+        print(f"Model selection error: {e}")
         return "models/gemini-1.5-flash"
 
-def call_gemini_dynamic(image_b64):
-    # 1. Find the correct model name dynamically
-    model_name = get_dynamic_model_name()
-    
-    # Ensure model_name doesn't duplicate 'models/' prefix if API URL adds it
-    # The API URL format is .../models/MODEL_NAME:generateContent
-    # If the helper returns 'models/gemini...', we just use it directly in the URL logic
-    
-    # Clean up name for URL construction
+def call_gemini_final(image_b64):
+    # 1. Get a valid model name
+    model_name = get_generative_model_name()
     short_name = model_name.replace("models/", "")
+    
+    print(f"USING MODEL: {short_name}")
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{short_name}:generateContent?key={GENAI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
@@ -154,8 +155,8 @@ async def extract_bill_data(request: DocumentRequest):
         # 3. Base64
         img_b64 = image_to_base64(target_image)
 
-        # 4. Call Dynamic AI
-        raw_response = call_gemini_dynamic(img_b64)
+        # 4. Call AI
+        raw_response = call_gemini_final(img_b64)
         
         # 5. Parse
         try:
