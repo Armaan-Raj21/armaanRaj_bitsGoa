@@ -59,7 +59,7 @@ async def extract_bill_data(request: DocumentRequest):
             image_parts.append(img)
 
         # 3. Prompt Engineering
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-pro-vision')
         prompt = """
         Analyze these bill images. Extract line item details.
         
