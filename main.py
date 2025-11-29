@@ -38,25 +38,24 @@ def download_file(url):
 
 def image_to_base64(image):
     buffered = io.BytesIO()
-    # Convert to RGB to ensure JPEG compatibility
     if image.mode != 'RGB':
         image = image.convert('RGB')
     image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def call_gemini_direct(image_b64):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GENAI_API_KEY}"
+def call_gemini_smart(image_b64):
+    # LIST OF MODELS TO TRY (In order of preference)
+    models_to_try = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-001",
+        "gemini-1.5-pro",
+        "gemini-pro-vision"
+    ]
     
     headers = {'Content-Type': 'application/json'}
     
     prompt_text = """
-    Analyze this bill. Extract line items strictly.
-    Rules:
-    1. Identify 'page_type' (Bill Detail / Final Bill / Pharmacy).
-    2. Extract item_name, item_amount, item_rate, item_quantity.
-    3. No double counting.
-    4. Return strict JSON.
-    
+    Extract bill data. Return JSON.
     Schema:
     {
         "pagewise_line_items": [
@@ -65,7 +64,7 @@ def call_gemini_direct(image_b64):
                 "page_type": "Bill Detail",
                 "bill_items": [
                     {
-                        "item_name": "string",
+                        "item_name": "str",
                         "item_amount": 0.0,
                         "item_rate": 0.0,
                         "item_quantity": 0.0
@@ -81,22 +80,34 @@ def call_gemini_direct(image_b64):
         "contents": [{
             "parts": [
                 {"text": prompt_text},
-                {
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": image_b64
-                    }
-                }
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
             ]
         }]
     }
-    
-    response = requests.post(url, headers=headers, json=payload)
-    
-    if response.status_code != 200:
-        raise Exception(f"Google API Error: {response.text}")
+
+    last_error = ""
+
+    # LOOP THROUGH MODELS
+    for model_name in models_to_try:
+        print(f"Attempting to use model: {model_name}...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GENAI_API_KEY}"
         
-    return response.json()
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            
+            # If success (200), return immediately
+            if response.status_code == 200:
+                print(f"SUCCESS with {model_name}")
+                return response.json()
+            else:
+                error_msg = response.text
+                print(f"Failed {model_name}: {error_msg}")
+                last_error = error_msg
+        except Exception as e:
+            print(f"Connection error on {model_name}: {e}")
+
+    # If all failed
+    raise Exception(f"All models failed. Last error: {last_error}")
 
 @app.post("/extract-bill-data")
 async def extract_bill_data(request: DocumentRequest):
@@ -105,49 +116,41 @@ async def extract_bill_data(request: DocumentRequest):
         # 1. Download
         temp_path, ext = download_file(request.document)
         
-        # 2. Get the FIRST image only
-        # (To prevent timeouts, we process the first page/image which usually has the bill)
+        # 2. Get Image
         target_image = None
         if ext == ".pdf":
             try:
                 images = convert_from_path(temp_path)
-                if images:
-                    target_image = images[0]
+                if images: target_image = images[0]
             except:
                 raise HTTPException(status_code=500, detail="PDF Error. Is Poppler installed?")
         else:
             target_image = Image.open(temp_path)
 
-        if not target_image:
-            raise Exception("No image could be processed from file.")
+        if not target_image: raise Exception("No image found.")
 
-        # 3. Convert to Base64 for Direct API Call
+        # 3. Base64
         img_b64 = image_to_base64(target_image)
 
-        # 4. Call Google REST API Directly
-        raw_response = call_gemini_direct(img_b64)
+        # 4. Call Smart AI
+        raw_response = call_gemini_smart(img_b64)
         
-        # 5. Parse Data
+        # 5. Parse
         try:
             candidates = raw_response.get('candidates', [])
-            if not candidates:
-                raise Exception("No candidates in AI response")
-                
+            if not candidates: raise Exception("AI returned empty candidates")
+            
             text_part = candidates[0]['content']['parts'][0]['text']
             clean_text = text_part.replace("```json", "").replace("```", "").strip()
             data = json.loads(clean_text)
             
-            # Usage Metadata
             usage = raw_response.get('usageMetadata', {})
             token_usage = {
                 "total_tokens": usage.get('totalTokenCount', 0),
                 "input_tokens": usage.get('promptTokenCount', 0),
                 "output_tokens": usage.get('candidatesTokenCount', 0)
             }
-            
-        except Exception as parse_err:
-            print(f"Parsing failed: {parse_err}")
-            # Fallback
+        except:
             data = {"pagewise_line_items": [], "total_item_count": 0}
             token_usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
 
