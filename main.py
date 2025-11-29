@@ -11,22 +11,33 @@ from PIL import Image
 
 app = FastAPI()
 
-# Configure Gemini
-# We will set this API Key in Render Environment Variables later
+# 1. Setup Gemini
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_API_KEY:
     genai.configure(api_key=GENAI_API_KEY)
+    
+    # --- DEBUGGING: PRINT AVAILABLE MODELS TO LOGS ---
+    try:
+        print("---- CHECKING AVAILABLE MODELS ----")
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                print(f"Found model: {m.name}")
+        print("---- END MODEL CHECK ----")
+    except Exception as e:
+        print(f"Error checking models: {e}")
 
 class DocumentRequest(BaseModel):
     document: str
 
 def download_file(url):
     try:
-        response = requests.get(url, stream=True)
+        # Fake user agent to prevent 403 errors from some sites
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, stream=True)
         response.raise_for_status()
-        content_type = response.headers.get('content-type', '').lower()
         
-        ext = ".jpg" # Default
+        content_type = response.headers.get('content-type', '').lower()
+        ext = ".jpg"
         if "pdf" in content_type: ext = ".pdf"
         elif "png" in content_type: ext = ".png"
         
@@ -44,32 +55,28 @@ async def extract_bill_data(request: DocumentRequest):
         # 1. Download
         temp_path, ext = download_file(request.document)
         
-        # 2. Prepare Images for AI
+        # 2. Prepare Images
         image_parts = []
         if ext == ".pdf":
-            # Convert PDF to images
             try:
                 images = convert_from_path(temp_path)
                 image_parts.extend(images)
             except Exception as e:
-                raise HTTPException(status_code=500, detail="PDF processing failed. Poppler issue.")
+                # If poppler fails, return a clear error
+                raise HTTPException(status_code=500, detail="PDF Error. Ensure Poppler is installed.")
         else:
-            # Handle standard images
             img = Image.open(temp_path)
             image_parts.append(img)
 
-        # 3. Prompt Engineering
-        model = genai.GenerativeModel('gemini-pro-vision')
+        # 3. Call AI - USING THE CORRECT MODEL
+        # We use 'gemini-1.5-flash' which is the standard current vision model
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
         prompt = """
-        Analyze these bill images. Extract line item details.
+        Analyze these bill images and extract data.
+        Output ONLY valid JSON.
         
-        CRITICAL RULES:
-        1. Identify the 'page_type': "Bill Detail", "Final Bill", or "Pharmacy".
-        2. Extract Item Name, Amount, Rate, and Quantity.
-        3. DO NOT DOUBLE COUNT. If a page summarizes previous items, process it but do not add the items again if they were on previous pages.
-        4. Calculate 'total_item_count'.
-        
-        Output strictly valid JSON (no markdown) in this exact structure:
+        Schema:
         {
             "pagewise_line_items": [
                 {
@@ -77,9 +84,9 @@ async def extract_bill_data(request: DocumentRequest):
                     "page_type": "Bill Detail",
                     "bill_items": [
                         {
-                            "item_name": "Consultation",
-                            "item_amount": 500.0,
-                            "item_rate": 500.0,
+                            "item_name": "Item Name",
+                            "item_amount": 100.0,
+                            "item_rate": 100.0,
                             "item_quantity": 1.0
                         }
                     ]
@@ -89,19 +96,15 @@ async def extract_bill_data(request: DocumentRequest):
         }
         """
 
-        # 4. Generate
         response = model.generate_content([prompt, *image_parts])
         
-        # 5. Parse JSON
+        # 4. Parse Response
         try:
-            # Strip markdown code blocks if Gemini adds them
             clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            extracted_data = json.loads(clean_text)
+            data = json.loads(clean_text)
         except:
-            # Fallback if AI fails to generate JSON
-            extracted_data = {"pagewise_line_items": [], "total_item_count": 0}
+            data = {"pagewise_line_items": [], "total_item_count": 0}
 
-        # 6. Return Formatted Response
         return {
             "is_success": True,
             "token_usage": {
@@ -109,18 +112,18 @@ async def extract_bill_data(request: DocumentRequest):
                 "input_tokens": response.usage_metadata.prompt_token_count,
                 "output_tokens": response.usage_metadata.candidates_token_count
             },
-            "data": extracted_data
+            "data": data
         }
 
     except Exception as e:
+        # Print the actual error to logs so we can see it
+        print(f"ERROR: {str(e)}")
         return {
             "is_success": False,
-            "token_usage": {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
             "data": {"pagewise_line_items": [], "total_item_count": 0},
             "error": str(e)
         }
     finally:
-        # Cleanup temp file
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
