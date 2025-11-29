@@ -13,7 +13,6 @@ from PIL import Image
 
 app = FastAPI()
 
-# Get API Key
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 class DocumentRequest(BaseModel):
@@ -44,17 +43,74 @@ def image_to_base64(image):
     image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def call_gemini_safe(image_b64):
-    # HARDCODED SAFE MODELS (High Quota First)
-    # We strictly use these names because we know they have Free Tiers.
-    safe_models = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest"
-    ]
+def get_best_available_model():
+    """
+    1. Asks Google: 'What models do I have?'
+    2. Filters out Embeddings (can't write).
+    3. Filters out Experimental/Preview (no free quota).
+    4. Picks the best remaining one.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GENAI_API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print("Failed to list models. Defaulting to 1.5-flash")
+            return "gemini-1.5-flash"
+
+        data = response.json()
+        all_models = data.get('models', [])
+        
+        valid_candidates = []
+        
+        print("---- MODEL DISCOVERY ----")
+        for m in all_models:
+            name = m['name'].replace("models/", "")
+            methods = m.get('supportedGenerationMethods', [])
+            
+            # Rule 1: Must be able to generate content
+            if 'generateContent' not in methods:
+                continue
+                
+            # Rule 2: No embeddings
+            if 'embedding' in name:
+                continue
+                
+            # Rule 3: Avoid 'experimental' or 'preview' (Causes 429 Quota Error)
+            # Unless it's the ONLY option we have.
+            is_risky = 'exp' in name or 'preview' in name or '002' in name
+            
+            valid_candidates.append((name, is_risky))
+            print(f"Found candidate: {name} (Risky: {is_risky})")
+            
+        if not valid_candidates:
+            raise Exception("No text-generation models found for this API key.")
+
+        # SELECTION LOGIC
+        # 1. Try to find a Safe Flash model
+        for name, risky in valid_candidates:
+            if 'flash' in name and not risky:
+                print(f"SELECTED SAFE MODEL: {name}")
+                return name
+                
+        # 2. Try to find a Safe Pro model
+        for name, risky in valid_candidates:
+            if 'pro' in name and not risky:
+                print(f"SELECTED SAFE MODEL: {name}")
+                return name
+
+        # 3. If no safe models, pick the first Risky one (better than nothing)
+        print(f"No safe models found. Using risky fallback: {valid_candidates[0][0]}")
+        return valid_candidates[0][0]
+
+    except Exception as e:
+        print(f"Discovery failed: {e}")
+        return "gemini-1.5-flash"
+
+def call_gemini_auto(image_b64):
+    # Get the specific model name allowed for this key
+    model_name = get_best_available_model()
     
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GENAI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
     prompt_text = """
@@ -87,44 +143,13 @@ def call_gemini_safe(image_b64):
             ]
         }]
     }
-
-    last_error = ""
-
-    # Try each safe model one by one
-    for model_name in safe_models:
-        print(f"Trying safe model: {model_name}...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GENAI_API_KEY}"
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code != 200:
+        raise Exception(f"Google API Error ({model_name}): {response.text}")
         
-        try:
-            response = requests.post(url, headers=headers, json=payload)
-            
-            # If successful, return data immediately
-            if response.status_code == 200:
-                print(f"SUCCESS with {model_name}")
-                return response.json()
-            
-            # If Rate Limit (429), wait 2 seconds and try next model
-            elif response.status_code == 429:
-                print(f"Rate Limit hit on {model_name}. Switching...")
-                last_error = f"429 Rate Limit on {model_name}"
-                time.sleep(1)
-                continue
-                
-            # If Not Found (404), just try next
-            elif response.status_code == 404:
-                print(f"Model {model_name} not found. Skipping...")
-                last_error = f"404 Not Found on {model_name}"
-                continue
-            
-            else:
-                last_error = response.text
-                print(f"Error on {model_name}: {last_error}")
-
-        except Exception as e:
-            print(f"Connection failed for {model_name}: {e}")
-
-    # If loop finishes without success
-    raise Exception(f"All safe models failed. Last error: {last_error}")
+    return response.json()
 
 @app.post("/extract-bill-data")
 async def extract_bill_data(request: DocumentRequest):
@@ -149,8 +174,8 @@ async def extract_bill_data(request: DocumentRequest):
         # 3. Base64
         img_b64 = image_to_base64(target_image)
 
-        # 4. Call Safe AI
-        raw_response = call_gemini_safe(img_b64)
+        # 4. Call AI with Auto-Discovery
+        raw_response = call_gemini_auto(img_b64)
         
         # 5. Parse
         try:
