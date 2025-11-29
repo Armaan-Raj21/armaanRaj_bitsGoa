@@ -12,8 +12,8 @@ from PIL import Image
 
 app = FastAPI()
 
-# Get API Key
-GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Get API Key and strip whitespace just in case
+GENAI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 class DocumentRequest(BaseModel):
     document: str
@@ -43,19 +43,58 @@ def image_to_base64(image):
     image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def call_gemini_smart(image_b64):
-    # LIST OF MODELS TO TRY (In order of preference)
-    models_to_try = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-pro",
-        "gemini-pro-vision"
-    ]
+def get_dynamic_model_name():
+    """
+    Asks Google which models are available for this specific API Key
+    and selects the best one dynamically.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GENAI_API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Error listing models: {response.text}")
+            return "models/gemini-1.5-flash" # Fallback
+
+        data = response.json()
+        available_models = [m['name'] for m in data.get('models', [])]
+        print(f"AVAILABLE MODELS FOR THIS KEY: {available_models}")
+
+        # Priority list: Look for these strings in the available models
+        # We prefer Flash 1.5, then Pro 1.5, then any Flash
+        priorities = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-vision"]
+        
+        for p in priorities:
+            for model in available_models:
+                if p in model:
+                    print(f"Selected Model: {model}")
+                    return model # Return full name e.g. 'models/gemini-1.5-flash-001'
+        
+        # If no specific match, take ANY model that supports generation
+        if available_models:
+            return available_models[0]
+            
+        return "models/gemini-1.5-flash" # Ultimate fallback
+        
+    except Exception as e:
+        print(f"Model selection failed: {e}")
+        return "models/gemini-1.5-flash"
+
+def call_gemini_dynamic(image_b64):
+    # 1. Find the correct model name dynamically
+    model_name = get_dynamic_model_name()
     
+    # Ensure model_name doesn't duplicate 'models/' prefix if API URL adds it
+    # The API URL format is .../models/MODEL_NAME:generateContent
+    # If the helper returns 'models/gemini...', we just use it directly in the URL logic
+    
+    # Clean up name for URL construction
+    short_name = model_name.replace("models/", "")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{short_name}:generateContent?key={GENAI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
     prompt_text = """
-    Extract bill data. Return JSON.
+    Extract bill data strictly as JSON.
     Schema:
     {
         "pagewise_line_items": [
@@ -84,30 +123,13 @@ def call_gemini_smart(image_b64):
             ]
         }]
     }
-
-    last_error = ""
-
-    # LOOP THROUGH MODELS
-    for model_name in models_to_try:
-        print(f"Attempting to use model: {model_name}...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GENAI_API_KEY}"
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code != 200:
+        raise Exception(f"Google API Error ({short_name}): {response.text}")
         
-        try:
-            response = requests.post(url, headers=headers, json=payload)
-            
-            # If success (200), return immediately
-            if response.status_code == 200:
-                print(f"SUCCESS with {model_name}")
-                return response.json()
-            else:
-                error_msg = response.text
-                print(f"Failed {model_name}: {error_msg}")
-                last_error = error_msg
-        except Exception as e:
-            print(f"Connection error on {model_name}: {e}")
-
-    # If all failed
-    raise Exception(f"All models failed. Last error: {last_error}")
+    return response.json()
 
 @app.post("/extract-bill-data")
 async def extract_bill_data(request: DocumentRequest):
@@ -132,8 +154,8 @@ async def extract_bill_data(request: DocumentRequest):
         # 3. Base64
         img_b64 = image_to_base64(target_image)
 
-        # 4. Call Smart AI
-        raw_response = call_gemini_smart(img_b64)
+        # 4. Call Dynamic AI
+        raw_response = call_gemini_dynamic(img_b64)
         
         # 5. Parse
         try:
@@ -161,6 +183,7 @@ async def extract_bill_data(request: DocumentRequest):
         }
 
     except Exception as e:
+        print(f"CRITICAL ERROR: {str(e)}")
         return {
             "is_success": False,
             "token_usage": {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
