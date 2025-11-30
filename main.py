@@ -5,7 +5,6 @@ import json
 import tempfile
 import base64
 import io
-import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pdf2image import convert_from_path
@@ -24,10 +23,19 @@ def download_file(url):
         response = requests.get(url, headers=headers, stream=True)
         response.raise_for_status()
         
+        # --- FIX: ROBUST EXTENSION DETECTION ---
+        # 1. Check Content-Type header
         content_type = response.headers.get('content-type', '').lower()
-        ext = ".jpg"
-        if "pdf" in content_type: ext = ".pdf"
-        elif "png" in content_type: ext = ".png"
+        # 2. Check URL string
+        url_lower = url.lower()
+        
+        ext = ".jpg" # Default fallback
+        
+        # If header says PDF OR url ends with .pdf
+        if "pdf" in content_type or url_lower.endswith(".pdf"):
+            ext = ".pdf"
+        elif "png" in content_type or url_lower.endswith(".png"):
+            ext = ".png"
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             for chunk in response.iter_content(chunk_size=8192):
@@ -44,17 +52,10 @@ def image_to_base64(image):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 def get_best_available_model():
-    """
-    1. Asks Google: 'What models do I have?'
-    2. Filters out Embeddings (can't write).
-    3. Filters out Experimental/Preview (no free quota).
-    4. Picks the best remaining one.
-    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GENAI_API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            print("Failed to list models. Defaulting to 1.5-flash")
             return "gemini-1.5-flash"
 
         data = response.json()
@@ -62,54 +63,32 @@ def get_best_available_model():
         
         valid_candidates = []
         
-        print("---- MODEL DISCOVERY ----")
         for m in all_models:
             name = m['name'].replace("models/", "")
             methods = m.get('supportedGenerationMethods', [])
+            if 'generateContent' not in methods: continue
+            if 'embedding' in name: continue
             
-            # Rule 1: Must be able to generate content
-            if 'generateContent' not in methods:
-                continue
-                
-            # Rule 2: No embeddings
-            if 'embedding' in name:
-                continue
-                
-            # Rule 3: Avoid 'experimental' or 'preview' (Causes 429 Quota Error)
-            # Unless it's the ONLY option we have.
             is_risky = 'exp' in name or 'preview' in name or '002' in name
-            
             valid_candidates.append((name, is_risky))
-            print(f"Found candidate: {name} (Risky: {is_risky})")
             
         if not valid_candidates:
-            raise Exception("No text-generation models found for this API key.")
+            return "gemini-1.5-flash"
 
-        # SELECTION LOGIC
-        # 1. Try to find a Safe Flash model
+        # 1. Try Safe Flash
         for name, risky in valid_candidates:
-            if 'flash' in name and not risky:
-                print(f"SELECTED SAFE MODEL: {name}")
-                return name
-                
-        # 2. Try to find a Safe Pro model
+            if 'flash' in name and not risky: return name
+        # 2. Try Safe Pro
         for name, risky in valid_candidates:
-            if 'pro' in name and not risky:
-                print(f"SELECTED SAFE MODEL: {name}")
-                return name
+            if 'pro' in name and not risky: return name
 
-        # 3. If no safe models, pick the first Risky one (better than nothing)
-        print(f"No safe models found. Using risky fallback: {valid_candidates[0][0]}")
         return valid_candidates[0][0]
 
-    except Exception as e:
-        print(f"Discovery failed: {e}")
+    except:
         return "gemini-1.5-flash"
 
 def call_gemini_auto(image_b64):
-    # Get the specific model name allowed for this key
     model_name = get_best_available_model()
-    
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GENAI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
@@ -145,10 +124,8 @@ def call_gemini_auto(image_b64):
     }
     
     response = requests.post(url, headers=headers, json=payload)
-    
     if response.status_code != 200:
-        raise Exception(f"Google API Error ({model_name}): {response.text}")
-        
+        raise Exception(f"Google API Error: {response.text}")
     return response.json()
 
 @app.post("/extract-bill-data")
@@ -171,13 +148,11 @@ async def extract_bill_data(request: DocumentRequest):
 
         if not target_image: raise Exception("No image found.")
 
-        # 3. Base64
+        # 3. Process
         img_b64 = image_to_base64(target_image)
-
-        # 4. Call AI with Auto-Discovery
         raw_response = call_gemini_auto(img_b64)
         
-        # 5. Parse
+        # 4. Parse
         try:
             candidates = raw_response.get('candidates', [])
             if not candidates: raise Exception("AI returned empty candidates")
@@ -203,7 +178,6 @@ async def extract_bill_data(request: DocumentRequest):
         }
 
     except Exception as e:
-        print(f"CRITICAL ERROR: {str(e)}")
         return {
             "is_success": False,
             "token_usage": {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
